@@ -950,8 +950,21 @@ public class AuthController : ControllerBase
             displayName ?? openId,
             null);
 
-        await IniciarSesionCookie(usuario, "TikTok");
-        return IrAlPerfil();
+        // Si el callback llegó por el dominio del túnel, la cookie quedaría en ese dominio
+        // y /connect/authorize (en BackendUrl) no la vería. Se traspasa con un ticket.
+        var backendUrl = _configuration["BackendUrl"];
+
+        if (Uri.TryCreate(backendUrl, UriKind.Absolute, out var backendUri) &&
+            !string.Equals(backendUri.Host, Request.Host.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            var ticketNuevo = CrearTicketTikTok(usuario.Id, destino);
+
+            return Redirect(
+                $"{backendUri.GetLeftPart(UriPartial.Authority)}/api/Auth/tiktok/callback" +
+                $"?ticket={Uri.EscapeDataString(ticketNuevo)}");
+        }
+
+        return await FinalizarLogin(usuario, "TikTok", destino);
     }
 
     // ================= DISCORD =================
