@@ -2,7 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Authorization;
 namespace UsuarioApi.Controller;
-[Authorize]
+[TokenAuthorize]
 [ApiController]
 [Route("api/[controller]")]
 public class SeguidoresController : ControllerBase

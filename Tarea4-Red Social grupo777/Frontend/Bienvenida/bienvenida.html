@@ -75,8 +75,25 @@
 
         </section>
 
+        <section class="perfil-card" id="tokenCaja" hidden>
+            <div class="card-title">
+                <h2>Access token</h2>
+                <p>Emitido por OpenIddict (sesión: <strong id="tokenProveedor"></strong>).
+                   Pégalo en Scalar → <em>Authentication → Bearer</em>.</p>
+            </div>
+
+            <div class="campo">
+                <textarea id="tokenValor" rows="4" readonly></textarea>
+            </div>
+
+            <div class="acciones">
+                <button type="button" class="btn-guardar" id="copiarToken">Copiar token</button>
+            </div>
+        </section>
+
     </main>
 
+    <script src="../js/config.js"></script>
     <script src="perfil.js"></script>
 </body>
 </html>

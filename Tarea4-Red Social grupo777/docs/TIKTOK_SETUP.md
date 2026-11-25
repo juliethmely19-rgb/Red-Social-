@@ -101,3 +101,28 @@ La documentación interactiva está en `http://localhost:5294/scalar/`.
 Si cambia la URL de ngrok, actualiza **tres** sitios antes de volver a probar:
 la variable de entorno/User Secret `TikTok:RedirectUri`, el registro en TikTok
 Developers y, si aplica, las URL del sitio y las páginas legales.
+
+## 6. Con Docker Compose (nginx en el 5290)
+
+Con `docker compose -f contructor.yml up -d --build` el backend queda detrás de nginx
+(puerto **5290**, varias réplicas). El túnel debe apuntar a nginx, no a una réplica:
+
+```bash
+ngrok http 5290 --inspect=false
+```
+
+Completa en el `.env` de la raíz (no hace falta tocar los ymls):
+
+```env
+TIKTOK_CLIENT_KEY=<client-key-del-sandbox>
+TIKTOK_CLIENT_SECRET=<client-secret-del-sandbox>
+TIKTOK_REDIRECT_URI=https://<tu-url-https-ngrok>/auth/tiktok/callback/
+```
+
+Aplica el cambio con `docker compose -f contructor.yml up -d` y registra en TikTok
+Developers la misma URL (sitio, Términos `/legal/tos.html`, Privacidad `/legal/privacy.html`
+y Redirect URI). El handoff por ticket funciona con varias réplicas porque comparten
+Redis y las claves de Data Protection.
+
+Con `dotnet run` el puerto es el 5290 (`launchSettings.json`), así que el túnel también
+es `ngrok http 5290`; las mismas variables se leen del `.env`.

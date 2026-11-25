@@ -1,14 +1,4 @@
-const API_URL = (() => {
-    if (window.API_URL) return window.API_URL;
-
-    const { protocol, hostname, port } = window.location;
-
-    if (port === "5500") {
-        return `${protocol}//${hostname}:5290`;
-    }
-
-    return window.location.origin;
-})();
+const API_URL = (window.APP_CONFIG && window.APP_CONFIG.API_URL) || "http://localhost:5290";
 
 const nombre = document.getElementById("nombre");
 const email = document.getElementById("email");
@@ -43,21 +33,38 @@ function mostrarUsuario(datos) {
         datos.estado || "Activo";
 }
 
+
 async function cargarPerfil() {
     try {
+        const token = sessionStorage.getItem("access_token");
+
+        if (!token) {
+            console.error("No existe un access_token.");
+            mensaje.textContent = "No se encontró una sesión válida.";
+            return;
+        }
+
         const respuesta = await fetch(`${API_URL}/api/Auth/me`, {
-            credentials: "include"
+            headers: {
+                "Authorization": `Bearer ${token}`
+            }
         });
 
-        if (!respuesta.ok) {
-            window.location.href = `${API_URL}/login.html`;
+        if (respuesta.status === 401 || respuesta.status === 403) {
+            mensaje.textContent = "Tu sesión no es válida o no tienes permisos.";
             return;
+        }
+
+        if (!respuesta.ok) {
+            throw new Error(`Error HTTP: ${respuesta.status}`);
         }
 
         const sesion = await respuesta.json();
 
+        mostrarToken(token, sesion.proveedor);
+
         let datos = {
-            user: sesion.nombre || "Usuario",
+            user: sesion.nombre || sesion.name || "Usuario",
             email: sesion.email || "",
             biografia: "",
             fecha: "",
@@ -66,8 +73,13 @@ async function cargarPerfil() {
 
         try {
             const perfil = await fetch(
-                `${API_URL}/api/Usuario/Buscar/${encodeURIComponent(sesion.nombre)}`,
-                { credentials: "include" });
+                `${API_URL}/api/Usuario/Buscar/${encodeURIComponent(datos.user)}`,
+                {
+                    headers: {
+                        "Authorization": `Bearer ${token}`
+                    }
+                }
+            );
 
             if (perfil.ok) {
                 const usuario = await perfil.json();
@@ -80,14 +92,16 @@ async function cargarPerfil() {
                     estado: usuario.estado ?? datos.estado
                 };
             }
-        } catch {
-            // Si falla la consulta del perfil, se muestran los datos de la sesión.
+        } catch (error) {
+            console.error("No se pudo consultar el perfil:", error);
         }
 
         usuarioOriginal = { ...datos };
         mostrarUsuario(datos);
-    } catch {
-        window.location.href = `${API_URL}/login.html`;
+
+    } catch (error) {
+        console.error("No se pudo cargar el perfil:", error);
+        mensaje.textContent = "No se pudo cargar la información del perfil.";
     }
 }
 
@@ -106,13 +120,50 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 });
 
+
+// Muestra el access token para pegarlo en Scalar (botón Authorize / Auth → Bearer).
+function mostrarToken(token, proveedor) {
+    const caja = document.getElementById("tokenCaja");
+    const campo = document.getElementById("tokenValor");
+    const via = document.getElementById("tokenProveedor");
+
+    if (!caja || !campo) return;
+
+    campo.value = token;
+    if (via) via.textContent = proveedor || "OpenIddict";
+    caja.hidden = false;
+
+    document.getElementById("copiarToken")?.addEventListener("click", async () => {
+        try {
+            await navigator.clipboard.writeText(token);
+        } catch {
+            campo.select();
+            document.execCommand("copy");
+        }
+        mensaje.textContent = "Access token copiado. Pégalo en Scalar como Bearer.";
+    });
+}
+
 async function cerrarVista() {
+    const token = sessionStorage.getItem("access_token");
+
     try {
         await fetch(`${API_URL}/api/Auth/logout`, {
             method: "POST",
-            credentials: "include"
+            // credentials: "include" para que el backend borre su cookie de sesión.
+            credentials: "include",
+            headers: token
+                ? { "Authorization": `Bearer ${token}` }
+                : {}
         });
+    } catch (error) {
+        console.error("Error al cerrar sesión:", error);
     } finally {
+        sessionStorage.removeItem("access_token");
+        sessionStorage.removeItem("id_token");
+        sessionStorage.removeItem("oidc_state");
+        sessionStorage.removeItem("oidc_code_verifier");
+
         window.location.href = `${API_URL}/login.html`;
     }
 }

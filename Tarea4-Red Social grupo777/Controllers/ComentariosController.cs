@@ -5,7 +5,7 @@ using Microsoft.EntityFrameworkCore;
 
 [ApiController]
 [Route("api/[controller]")]
-[Authorize]
+[TokenAuthorize]
 public class ComentariosController : ControllerBase
 {
     private readonly Context _context;
@@ -71,7 +71,15 @@ public class ComentariosController : ControllerBase
 
     private async Task<int> ObtenerORegistrarUsuarioActualAsync()
     {
-        var email = User.FindFirst(ClaimTypes.Email)?.Value ?? "oauth@redsocial.local";
+        // El access token de OpenIddict lleva el Id del usuario local en el claim "sub".
+        var sub = User.FindFirst("sub")?.Value ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (int.TryParse(sub, out var idToken) &&
+            await _context.Usuarios.AnyAsync(u => u.Id == idToken))
+        {
+            return idToken;
+        }
+
+        var email = User.FindFirst("email")?.Value ?? User.FindFirst(ClaimTypes.Email)?.Value ?? "oauth@redsocial.local";
         var nombre = User.Identity?.Name ?? "UsuarioOAuth";
         var usuario = await _context.Usuarios.FirstOrDefaultAsync(u => u.email == email);
         if (usuario == null)
@@ -80,7 +88,7 @@ public class ComentariosController : ControllerBase
             {
                 User = nombre,
                 email = email,
-                Biografia = $"Autenticado con {User.FindFirst("proveedor")?.Value ?? "OAuth"}",
+                Biografia = $"Autenticado con {User.FindFirst("provider")?.Value ?? User.FindFirst("proveedor")?.Value ?? "OAuth"}",
                 Fecha = DateTime.UtcNow.ToString("yyyy-MM-dd"),
                 Estado = "Activo"
             };

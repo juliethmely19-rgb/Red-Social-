@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 
 [ApiController]
 [Route("api/[controller]")]
-[Authorize]
+[TokenAuthorize]
 public class HashtagsController : ControllerBase
 {
     private readonly Context _context;

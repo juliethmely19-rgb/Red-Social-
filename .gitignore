@@ -280,3 +280,5 @@ appsettings.json
 .env
 .env.*
 !.env.example
+.env
+certificados/*.pfx

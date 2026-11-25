@@ -2,74 +2,71 @@
 
 API REST desarrollada con ASP.NET Core .NET 10 y PostgreSQL. Permite gestionar usuarios mediante operaciones CRUD, con persistencia de datos en una base de datos PostgreSQL.
 
-## Ejecutar en local con `dotnet run`
+## Configuración (`.env`)
 
-Requisitos: .NET 10 y PostgreSQL escuchando en el puerto **5433** con la base `RedsocialDB`, usuario `postgres` y contraseña `11ye` (así lo espera `appsettings.Development.json`).
-
-Si no tienes esa base, puedes crearla con Docker:
+Todo se configura en un único archivo `.env` en la raíz. Lo leen **Docker Compose** y también **`dotnet run`** (el backend lo carga solo al arrancar).
 
 ```bash
-docker run -d --name pg-gerson \
-  -e POSTGRES_PASSWORD=11ye \
-  -e POSTGRES_DB=RedsocialDB \
-  -p 5433:5432 postgres:17
+cp .env.example .env   # y completa los secretos
 ```
 
-Luego ejecuta:
+Variables principales: `BACKEND_PORT=5290`, `FRONTEND_PORT=5500`, `BACKEND_REPLICAS=3`, `BACKEND_URL`, `FRONTEND_URL`, `POSTGRES_*`, `OPENIDDICT_CERT_PASSWORD` y las credenciales de cada proveedor (`GOOGLE_*`, `GITHUB_*`, `DROPBOX_*`, `FIGMA_*`, `TWITTER_*`, `TIKTOK_*`). Los comentarios del archivo explican cada una. Las variables ya definidas en la terminal tienen prioridad sobre el `.env`.
+
+> Mantén `BACKEND_PORT=5290`: las URLs de callback registradas en los proveedores OAuth apuntan a ese puerto.
+
+## Ejecutar en local con `dotnet run`
+
+Requisitos: .NET 10 y una base PostgreSQL. La forma más simple es usar la del compose (publica `127.0.0.1:5433`):
+
+```bash
+docker compose -f contructor.yml up -d postgres
+```
+
+Luego:
 
 ```bash
 cd "Tarea4-Red Social grupo777"
 dotnet run
 ```
 
-Abre <http://localhost:5290/login.html>.
+Con `dotnet run` (entorno Development):
 
-Si aparece el error `Failed to bind to address http://127.0.0.1:5290: address already in use`, hay otro proceso usando el puerto. Libéralo con:
+- La conexión a PostgreSQL se arma con `POSTGRES_*` del `.env` contra `localhost:5433`.
+- Las migraciones se aplican solas y el cliente OpenIddict se registra al arrancar.
+- Usa los certificados de `certificados/*.pfx` (con `OPENIDDICT_CERT_PASSWORD`); si no existen, usa certificados de desarrollo.
+- Las páginas las sirve el propio backend: <http://localhost:5290/login.html> (también `/login/login.html`, `/Bienvenida/bienvenida.html`, `/callback.html`).
+- Para el flujo completo con el frontend en el 5500 abre `Frontend/` con Live Server (raíz = carpeta `Frontend`) o levanta `docker compose -f contructor.yml up -d frontend`.
 
-```bash
-fuser -k 5290/tcp
-```
+Si aparece `address already in use` en el 5290 (por ejemplo, porque el compose está levantado), libéralo con `docker compose -f contructor.yml down` o `fuser -k 5290/tcp`.
 
 ## Ejecutar con Docker (Construcción)
 
-Abre una terminal en la raíz del proyecto, donde se encuentran el archivo `contructor.yml` y `.env.example`.
-
-Primero, crea tu archivo de variables de entorno:
-
-```bash
-cp .env.example .env
-```
-
-Configura las credenciales y el puerto en `.env`:
-
-```env
-BACKEND_PORT=5290
-FRONTEND_PORT=5500
-POSTGRES_DB=RedsocialDB
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=11ye
-```
-
-> El proyecto también funciona sin `.env`: los archivos Compose usan esos valores por defecto. Mantén `BACKEND_PORT=5290` para que coincidan las URLs de callback de los proveedores OAuth.
-
-Construye la imagen y levanta los servicios:
-
 ```bash
 docker compose -f contructor.yml up -d --build
-```
-
-Comprueba que ambos contenedores estén funcionando:
-
-```bash
 docker compose -f contructor.yml ps
 ```
 
-La configuración levanta dos servicios:
+Servicios:
 
-- **Backend:** API desarrollada en ASP.NET Core.
-- **PostgreSQL:** base de datos que almacena la información de los usuarios.
+- **balanceador:** nginx en el puerto **5290** (`nginx/nginx.conf`), reparte entre las réplicas del backend.
+- **backend:** `BACKEND_REPLICAS` réplicas (3 por defecto) sin puerto publicado; comparten PostgreSQL, Redis (sesión), las claves de Data Protection (volumen) y los certificados de `certificados/`.
+- **frontend:** nginx con los HTML en el puerto **5500**.
+- **migraciones:** job que migra la base y registra el cliente OpenIddict antes de levantar el backend.
+- **redis** y **postgres**.
 
-La API se conecta a PostgreSQL utilizando el nombre del servicio `postgres` como host. Los datos se conservan en el volumen nombrado `datos-postgres`, incluso si se detienen o eliminan los contenedores.
+Cambiar el número de réplicas sin tocar el archivo:
+
+```bash
+docker compose -f contructor.yml up -d --scale backend=5
+```
+
+Comprobar el balanceo (la cabecera `X-Servido-Por` cambia de IP):
+
+```bash
+for i in 1 2 3 4; do curl -sI http://localhost:5290/openapi/v1.json | grep -i x-servido-por; done
+```
+
+Los datos se conservan en el volumen `redsocial-datos-postgres`.
 
 ## Consultar la API
 
@@ -113,28 +110,13 @@ http://localhost:5290/signin-google
 http://localhost:5290/auth/twitter/callback
 ```
 
-### Google
+### Credenciales de los proveedores
 
-El Client Secret se configura una sola vez en cada máquina, fuera de Git:
+Todas van en el `.env` (no se guardan en `appsettings*.json`). En Docker, `docker compose ... up -d` vuelve a leer el `.env`.
 
-**Ejecución local con `dotnet run`:**
+### TikTok
 
-```bash
-cd "Tarea4-Red Social grupo777"
-dotnet user-secrets set "Google:ClientSecret" "TU_CLIENT_SECRET"
-```
-
-**Docker:**
-
-```bash
-cd /home/gerson/Red-Social-
-printf '\nGOOGLE_CLIENT_SECRET=TU_CLIENT_SECRET\n' >> .env
-docker compose -f contructor.yml up -d --build
-```
-
-El archivo `.env` está en `.gitignore`, así que el secreto no se sube.
-
-En <https://console.cloud.google.com/apis/credentials> verifica que el URI de redirección autorizado sea `http://localhost:5290/signin-google` y que tu correo esté como usuario de prueba si la pantalla de consentimiento está en modo de prueba.
+TikTok no acepta `localhost`. Además de `TIKTOK_CLIENT_KEY` y `TIKTOK_CLIENT_SECRET`, define `TIKTOK_REDIRECT_URI` con una URL **HTTPS pública** que llegue al nginx del 5290 (por ejemplo `ngrok http 5290`) y que sea idéntica a la registrada en TikTok Developers, con barra final: `https://<tu-url>/auth/tiktok/callback/`. Detalle en `Tarea4-Red Social grupo777/docs/TIKTOK_SETUP.md`.
 
 ## Arrancar desde la imagen local (Despliegue)
 
@@ -146,7 +128,7 @@ Ejecuta:
 docker compose -f despliegue.yml up -d
 ```
 
-Este archivo utiliza la imagen local previamente construida mediante `contructor.yml`. No necesita el código fuente ni el Dockerfile para iniciar el backend.
+Este archivo utiliza las imágenes `redsocial` y `redsocial-frontend` previamente construidas con `contructor.yml` (`BACKEND_IMAGE`, `FRONTEND_IMAGE` y `PULL_POLICY` en el `.env`). Sigue necesitando junto al archivo las carpetas `nginx/` y `certificados/`, pero no el código fuente.
 
 Para comprobar los contenedores:
 
@@ -174,15 +156,15 @@ Publica la imagen:
 docker push TU_USUARIO/redsocial:1.0
 ```
 
-En el archivo `despliegue.yml`, utiliza la imagen publicada:
+En el `.env`, utiliza la imagen publicada (publica también `redsocial-frontend` de la misma forma):
 
-```yaml
-backend:
-  image: TU_USUARIO/redsocial:1.0
-  pull_policy: always
+```env
+BACKEND_IMAGE=TU_USUARIO/redsocial:1.0
+FRONTEND_IMAGE=TU_USUARIO/redsocial-frontend:1.0
+PULL_POLICY=always
 ```
 
-De esta manera, Docker podrá descargar la imagen desde Docker Hub al momento del despliegue.
+De esta manera, Docker podrá descargar las imágenes desde Docker Hub al momento del despliegue.
 
 ## Detener los servicios
 
@@ -200,7 +182,9 @@ Los datos de PostgreSQL se conservan porque están almacenados en un volumen nom
 
 El proyecto utiliza los siguientes archivos:
 
-- `contructor.yml`: configuración para construir la imagen y levantar los servicios.
+- `contructor.yml`: configuración para construir las imágenes y levantar los servicios.
+- `nginx/nginx.conf`: balanceador del backend (puerto 5290).
+- `certificados/`: `signing.pfx` y `encryption.pfx` de OpenIddict (no se suben a Git).
 - `despliegue.yml`: configuración para ejecutar una imagen previamente construida.
 - `.env`: contiene las credenciales y variables de entorno utilizadas por Docker Compose.
 - `.env.example`: plantilla de las variables necesarias para ejecutar el proyecto.

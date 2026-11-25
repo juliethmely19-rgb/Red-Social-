@@ -1,62 +1,121 @@
+# Levanta todo con imágenes ya construidas (locales o de Docker Hub), sin compilar:
+#   docker compose -f despliegue.yml up -d
+#
+# Imágenes: BACKEND_IMAGE y FRONTEND_IMAGE en .env. Con imágenes locales deja
+# PULL_POLICY=never; con Docker Hub usa PULL_POLICY=always.
+#
+#   http://localhost:5290  -> nginx (balanceador) -> N réplicas del backend
+#   http://localhost:5500  -> frontend (nginx con los HTML)
+#
+# Número de réplicas: BACKEND_REPLICAS en .env (o --scale backend=N).
+
+x-backend-env: &backend-env
+  ASPNETCORE_ENVIRONMENT: Production
+  ASPNETCORE_HTTP_PORTS: "5290"
+  # Detrás de nginx: respeta X-Forwarded-Proto / X-Forwarded-For.
+  ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"
+  REDIS_CONNECTION: redis:6379
+  ConnectionStrings__Context: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-RedsocialDB};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD en .env}"
+  # Certificados de OpenIddict (carpeta ./certificados montada en /certificados)
+  OpenIddict__SigningCertificate__Path: /certificados/signing.pfx
+  OpenIddict__EncryptionCertificate__Path: /certificados/encryption.pfx
+  OpenIddict__CertificatePassword: "${OPENIDDICT_CERT_PASSWORD:-}"
+  # Migraciones y registro del cliente OpenIddict los hace el job "migraciones"
+  Database__MigrateOnStartup: "false"
+  OpenIddict__SeedOnStartup: "false"
+  BackendUrl: "${BACKEND_URL:-http://localhost:5290}"
+  FrontendUrl: "${FRONTEND_URL:-http://localhost:5500}"
+  Cors__AllowedOrigins: "${CORS_ALLOWED_ORIGINS:-}"
+  GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
+  GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
+  GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
+  GITHUB_CLIENT_SECRET: "${GITHUB_CLIENT_SECRET:-}"
+  DROPBOX_CLIENT_ID: "${DROPBOX_CLIENT_ID:-}"
+  DROPBOX_CLIENT_SECRET: "${DROPBOX_CLIENT_SECRET:-}"
+  FIGMA_CLIENT_ID: "${FIGMA_CLIENT_ID:-}"
+  FIGMA_CLIENT_SECRET: "${FIGMA_CLIENT_SECRET:-}"
+  TWITTER_CLIENT_ID: "${TWITTER_CLIENT_ID:-}"
+  TWITTER_CLIENT_SECRET: "${TWITTER_CLIENT_SECRET:-}"
+  TIKTOK_CLIENT_KEY: "${TIKTOK_CLIENT_KEY:-}"
+  TIKTOK_CLIENT_SECRET: "${TIKTOK_CLIENT_SECRET:-}"
+  TIKTOK_REDIRECT_URI: "${TIKTOK_REDIRECT_URI:-}"
+
 services:
 
+  # ---------- Backend (varias réplicas, sin puerto publicado) ----------
   backend:
-    image: redsocial
-    pull_policy: never
+    image: ${BACKEND_IMAGE:-redsocial}
+    pull_policy: ${PULL_POLICY:-never}
     expose:
       - "5290"
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-3}
+    restart: unless-stopped
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
-      ASPNETCORE_HTTP_PORTS: 5290
-      REDIS_CONNECTION: redis:6379
-      ConnectionStrings__Context: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-RedsocialDB};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD en .env}"
-      FrontendUrl: "http://localhost:${FRONTEND_PORT:-5500}"
-      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
-      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
-      GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
-      GITHUB_CLIENT_SECRET: "${GITHUB_CLIENT_SECRET:-}"
-      DROPBOX_CLIENT_ID: "${DROPBOX_CLIENT_ID:-}"
-      DROPBOX_CLIENT_SECRET: "${DROPBOX_CLIENT_SECRET:-}"
-      FIGMA_CLIENT_ID: "${FIGMA_CLIENT_ID:-}"
-      FIGMA_CLIENT_SECRET: "${FIGMA_CLIENT_SECRET:-}"
-      TWITTER_CLIENT_ID: "${TWITTER_CLIENT_ID:-}"
-      TWITTER_CLIENT_SECRET: "${TWITTER_CLIENT_SECRET:-}"
-      TIKTOK_CLIENT_KEY: "${TIKTOK_CLIENT_KEY:-}"
-      TIKTOK_CLIENT_SECRET: "${TIKTOK_CLIENT_SECRET:-}"
-      TIKTOK_REDIRECT_URI: "${TIKTOK_REDIRECT_URI:-}"
-
+      <<: *backend-env
     volumes:
+      # Claves de Data Protection compartidas: todas las réplicas descifran las
+      # mismas cookies (sesión, login, state de OAuth).
       - claves-dataprotection:/root/.aspnet/DataProtection-Keys
-
+      - ./certificados:/certificados:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5290' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
       migraciones:
         condition: service_completed_successfully
-
     networks:
       - red-social
 
+  # ---------- Balanceador: nginx en el 5290 ----------
   balanceador:
-    image: nginx:alpine
+    image: nginx:1.28-alpine
     ports:
-      - "${BACKEND_PORT:-5290}:80"
+      - "${BACKEND_PORT:-5290}:5290"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - red-social
 
+  # ---------- Frontend: nginx con los HTML en el 5500 ----------
   frontend:
-    image: redsocial-frontend
-    pull_policy: never
+    image: ${FRONTEND_IMAGE:-redsocial-frontend}
+    pull_policy: ${PULL_POLICY:-never}
     ports:
       - "${FRONTEND_PORT:-5500}:80"
+    environment:
+      # URL con la que el NAVEGADOR llega al backend (nginx del 5290)
+      API_URL: "${BACKEND_URL:-http://localhost:5290}"
+    restart: unless-stopped
     networks:
       - red-social
+
+  # ---------- Job de migraciones (corre una vez y termina) ----------
+  migraciones:
+    image: ${BACKEND_IMAGE:-redsocial}
+    pull_policy: ${PULL_POLICY:-never}
+    command: ["--migrar"]
+    restart: "no"
+    environment:
+      <<: *backend-env
+    volumes:
+      - claves-dataprotection:/root/.aspnet/DataProtection-Keys
+      - ./certificados:/certificados:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - red-social
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -68,25 +127,17 @@ services:
     networks:
       - red-social
 
-  migraciones:
-    image: redsocial
-    pull_policy: never
-    command: ["--migrar"]
-    environment:
-      ASPNETCORE_ENVIRONMENT: Production
-      ConnectionStrings__Context: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-RedsocialDB};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD en .env}"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - red-social
   postgres:
     image: postgres:17
     container_name: usuario-db
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-RedsocialDB}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD en .env}
+    ports:
+      # Solo desde esta máquina: sirve para `dotnet run` (POSTGRES_HOST_PORT).
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - datos-postgres:/var/lib/postgresql/data
     healthcheck:

@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 
 [ApiController]
 [Route("api/[controller]")]
-[Authorize]
+[TokenAuthorize]
 public class EtiquetasPublicacionController : ControllerBase
 {
     private readonly Context _context;

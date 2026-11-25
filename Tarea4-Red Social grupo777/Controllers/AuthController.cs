@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.Google;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.EntityFrameworkCore;
@@ -18,20 +20,27 @@ public class AuthController : ControllerBase
     private readonly Context _context;
     private readonly IConfiguration _configuration;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IDataProtector _estadoProtector;
+    private readonly IDataProtector _ticketProtector;
+    private readonly IDistributedCache _cache;
 
     public AuthController(
         Context context,
         IConfiguration configuration,
-        IHttpClientFactory httpClientFactory)
+        IHttpClientFactory httpClientFactory,
+        IDataProtectionProvider dataProtection,
+        IDistributedCache cache)
     {
         _context = context;
         _configuration = configuration;
         _httpClientFactory = httpClientFactory;
+        _estadoProtector = dataProtection.CreateProtector("RedSocial.OAuthState.v1");
+        _ticketProtector = dataProtection.CreateProtector("RedSocial.LoginTicket.v1");
+        _cache = cache;
     }
 
-    // ================= GOOGLE =================
     [HttpGet("GoogleLogin")]
-    public IActionResult GoogleLogin()
+    public IActionResult GoogleLogin([FromQuery] string? returnUrl)
     {
         if (!GoogleConfigurado())
         {
@@ -43,6 +52,13 @@ public class AuthController : ControllerBase
         {
             RedirectUri = Url.Action(nameof(GoogleResponse), "Auth")
         };
+
+        var destino = NormalizarReturnUrl(returnUrl);
+
+        if (destino != null)
+        {
+            propiedades.Items["returnUrl"] = destino;
+        }
 
         return Challenge(propiedades, GoogleDefaults.AuthenticationScheme);
     }
@@ -58,25 +74,33 @@ public class AuthController : ControllerBase
         }
 
         var identidad = resultado.Principal;
+
         var googleId = identidad.FindFirst(ClaimTypes.NameIdentifier)?.Value;
         var email = identidad.FindFirst(ClaimTypes.Email)?.Value;
         var nombre = identidad.FindFirst(ClaimTypes.Name)?.Value;
 
-        if (string.IsNullOrWhiteSpace(googleId) || string.IsNullOrWhiteSpace(email))
+        if (string.IsNullOrWhiteSpace(googleId) ||
+            string.IsNullOrWhiteSpace(email))
         {
             return VolverAlLogin("Google no proporcionó los datos necesarios.");
         }
 
-        var usuario = await ObtenerOCrearUsuario("Google", googleId, nombre, email);
+        var usuario = await ObtenerOCrearUsuario(
+            "Google", googleId, nombre, email);
+
+        var returnUrl =
+            resultado.Properties?.Items.TryGetValue("returnUrl", out var destino) == true
+                ? NormalizarReturnUrl(destino)
+                : null;
+
         await IniciarSesionCookie(usuario, "Google");
         await HttpContext.SignOutAsync("External");
 
-        return IrAlPerfil();
+        return RedirigirDespuesLogin(returnUrl);
     }
-
     // ================= GITHUB =================
     [HttpGet("GithubLogin")]
-    public IActionResult GithubLogin()
+    public IActionResult GithubLogin([FromQuery] string? returnUrl)
     {
         var clientId = Setting("GitHub:ClientId", "GITHUB_CLIENT_ID");
         var clientSecret = Setting("GitHub:ClientSecret", "GITHUB_CLIENT_SECRET");
@@ -88,7 +112,7 @@ public class AuthController : ControllerBase
         }
 
         var redirectUri = ProviderRedirectUri("GitHub", "/api/auth/callback");
-        var state = CrearState("github");
+        var state = CrearState("github", returnUrl);
 
         var url = "https://github.com/login/oauth/authorize" +
                   $"?client_id={Uri.EscapeDataString(clientId)}" +
@@ -117,7 +141,7 @@ public class AuthController : ControllerBase
             return VolverAlLogin(
                 "La sesión de autorización de GitHub expiró. Intenta de nuevo.");
         }
-
+        var destino = TomarReturnUrl("github");
         if (string.IsNullOrWhiteSpace(code))
         {
             return VolverAlLogin("GitHub no envió el código de autorización.");
@@ -217,13 +241,12 @@ public class AuthController : ControllerBase
             nombre ?? username,
             email);
 
-        await IniciarSesionCookie(usuario, "GitHub");
-        return IrAlPerfil();
+        return await FinalizarLogin(usuario, "GitHub", destino);
     }
 
     // ================= DROPBOX =================
     [HttpGet("dropbox/login")]
-    public IActionResult DropboxLogin()
+    public IActionResult DropboxLogin([FromQuery] string? returnUrl)
     {
         var clientId = Setting("Dropbox:ClientId", "DROPBOX_CLIENT_ID");
         var clientSecret = Setting("Dropbox:ClientSecret", "DROPBOX_CLIENT_SECRET");
@@ -235,7 +258,7 @@ public class AuthController : ControllerBase
         }
 
         var redirectUri = ProviderRedirectUri("Dropbox", "/auth/dropbox/callback");
-        var state = CrearState("dropbox");
+        var state = CrearState("dropbox", returnUrl);
 
         var url = "https://www.dropbox.com/oauth2/authorize" +
                   $"?client_id={Uri.EscapeDataString(clientId)}" +
@@ -285,7 +308,7 @@ public class AuthController : ControllerBase
             return VolverAlLogin(
                 "La sesión de autorización de Dropbox expiró. Intenta de nuevo.");
         }
-
+        var destino = TomarReturnUrl("dropbox");
         if (string.IsNullOrWhiteSpace(code))
         {
             return VolverAlLogin("Dropbox no envió el código de autorización.");
@@ -366,13 +389,12 @@ public class AuthController : ControllerBase
             : null;
 
         var usuario = await ObtenerOCrearUsuario("Dropbox", id, name, email);
-        await IniciarSesionCookie(usuario, "Dropbox");
-        return IrAlPerfil();
+        return await FinalizarLogin(usuario, "Dropbox", destino);
     }
 
     // ================= FIGMA =================
     [HttpGet("figma/login")]
-    public IActionResult FigmaLogin()
+    public IActionResult FigmaLogin([FromQuery] string? returnUrl)
     {
         var clientId = Setting("Figma:ClientId", "FIGMA_CLIENT_ID");
         var clientSecret = Setting("Figma:ClientSecret", "FIGMA_CLIENT_SECRET");
@@ -384,7 +406,7 @@ public class AuthController : ControllerBase
         }
 
         var redirectUri = ProviderRedirectUri("Figma", "/auth/figma/callback");
-        var state = CrearState("figma");
+        var state = CrearState("figma", returnUrl);
 
         var url = "https://www.figma.com/oauth" +
                   $"?client_id={Uri.EscapeDataString(clientId)}" +
@@ -434,7 +456,7 @@ public class AuthController : ControllerBase
             return VolverAlLogin(
                 "La sesión de autorización de Figma expiró. Intenta de nuevo.");
         }
-
+        var destino = TomarReturnUrl("figma");
         if (string.IsNullOrWhiteSpace(code))
         {
             return VolverAlLogin("Figma no envió el código de autorización.");
@@ -521,13 +543,12 @@ public class AuthController : ControllerBase
             : null;
 
         var usuario = await ObtenerOCrearUsuario("Figma", id, name, email);
-        await IniciarSesionCookie(usuario, "Figma");
-        return IrAlPerfil();
+        return await FinalizarLogin(usuario, "Figma", destino);
     }
 
     // ================= X (TWITTER) =================
     [HttpGet("twitter/login")]
-    public IActionResult TwitterLogin()
+    public IActionResult TwitterLogin([FromQuery] string? returnUrl)
     {
         var clientId = Setting("Twitter:ClientId", "TWITTER_CLIENT_ID");
         var clientSecret = Setting("Twitter:ClientSecret", "TWITTER_CLIENT_SECRET");
@@ -540,7 +561,7 @@ public class AuthController : ControllerBase
         }
 
         var redirectUri = ProviderRedirectUri("Twitter", "/auth/twitter/callback");
-        var state = CrearState("twitter");
+        var state = CrearState("twitter", returnUrl);
 
         // X exige PKCE (S256) para OAuth 2.0. El verifier se guarda en sesión y
         // se vuelve a enviar al canjear el código por el token.
@@ -598,7 +619,7 @@ public class AuthController : ControllerBase
             return VolverAlLogin(
                 "La sesión de autorización de X (Twitter) expiró. Intenta de nuevo.");
         }
-
+        var destino = TomarReturnUrl("twitter");
         if (string.IsNullOrWhiteSpace(code))
         {
             return VolverAlLogin("X (Twitter) no envió el código de autorización.");
@@ -645,7 +666,8 @@ public class AuthController : ControllerBase
 
         if (!tokenRes.IsSuccessStatusCode)
         {
-            return VolverAlLogin("No se pudo obtener el token de X (Twitter).");
+            return VolverAlLogin(
+                "No se pudo obtener el token de X (Twitter). " + await DetalleError(tokenRes));
         }
 
         using var tokenDoc = JsonDocument.Parse(
@@ -709,13 +731,12 @@ public class AuthController : ControllerBase
             name ?? username,
             null);
 
-        await IniciarSesionCookie(usuario, "X");
-        return IrAlPerfil();
+        return await FinalizarLogin(usuario, "X", destino);
     }
 
     // ================= TIKTOK =================
     [HttpGet("tiktok/login")]
-    public IActionResult TikTokLogin()
+    public IActionResult TikTokLogin([FromQuery] string? returnUrl)
     {
         var clientKey = Setting("TikTok:ClientKey", "TIKTOK_CLIENT_KEY");
         var clientSecret = Setting("TikTok:ClientSecret", "TIKTOK_CLIENT_SECRET");
@@ -737,7 +758,7 @@ public class AuthController : ControllerBase
                 "TikTok requiere un callback HTTPS público. Configura TIKTOK_REDIRECT_URI.");
         }
 
-        var state = CrearState("tiktok");
+        var state = CrearStateFirmado(returnUrl);
 
         var url = "https://www.tiktok.com/v2/auth/authorize/" +
                   $"?client_key={Uri.EscapeDataString(clientKey)}" +
@@ -755,9 +776,10 @@ public class AuthController : ControllerBase
         [FromQuery] string? state,
         [FromQuery] string? scopes,
         [FromQuery] string? error,
-        [FromQuery(Name = "error_description")] string? errorDescription)
+        [FromQuery(Name = "error_description")] string? errorDescription,
+        [FromQuery] string? ticket)
     {
-        return ProcesarTikTok(code, state, error, errorDescription);
+        return ProcesarTikTok(code, state, error, errorDescription, ticket);
     }
 
     // Ruta pública que se registra en TikTok Developers (Login Kit, Web).
@@ -767,29 +789,39 @@ public class AuthController : ControllerBase
         [FromQuery] string? state,
         [FromQuery] string? scopes,
         [FromQuery] string? error,
-        [FromQuery(Name = "error_description")] string? errorDescription)
+        [FromQuery(Name = "error_description")] string? errorDescription,
+        [FromQuery] string? ticket)
     {
-        return ProcesarTikTok(code, state, error, errorDescription);
+        return ProcesarTikTok(code, state, error, errorDescription, ticket);
     }
 
     private async Task<IActionResult> ProcesarTikTok(
         string? code,
         string? state,
         string? error,
-        string? errorDescription)
+        string? errorDescription,
+        string? ticket)
     {
+        // Segunda vuelta: el callback llegó por el túnel HTTPS (ngrok) y nos reenvió
+        // aquí con un ticket firmado para crear la cookie en el host del backend.
+        if (!string.IsNullOrWhiteSpace(ticket))
+        {
+            return await CanjearTicketTikTok(ticket);
+        }
+
         if (!string.IsNullOrWhiteSpace(error))
         {
             return VolverAlLogin(
                 $"TikTok rechazó el inicio de sesión: {errorDescription ?? error}");
         }
 
-        if (!ValidarState("tiktok", state))
+        // El state de TikTok va firmado: la cookie de sesión vive en localhost y el
+        // callback llega por el dominio HTTPS público, donde esa cookie no existe.
+        if (!LeerStateFirmado(state, out var destino))
         {
             return VolverAlLogin(
                 "La sesión de autorización de TikTok expiró. Intenta de nuevo.");
         }
-
         if (string.IsNullOrWhiteSpace(code))
         {
             return VolverAlLogin("TikTok no envió el código de autorización.");
@@ -937,7 +969,7 @@ public class AuthController : ControllerBase
         }
 
         var redirectUri = ProviderRedirectUri("Discord", "/api/Auth/discord/callback");
-        var state = CrearState("discord");
+        var state = CrearState("discord", null);
 
         var url = "https://discord.com/oauth2/authorize" +
                   $"?client_id={Uri.EscapeDataString(clientId)}" +
@@ -1479,7 +1511,9 @@ public class AuthController : ControllerBase
         });
 
     // ================= IDENTIDAD Y LOGOUT =================
+
     [HttpGet("me")]
+    [TokenAuthorize]
     public IActionResult Me()
     {
         if (User.Identity?.IsAuthenticated != true)
@@ -1487,17 +1521,21 @@ public class AuthController : ControllerBase
             return Unauthorized(new
             {
                 autenticado = false,
-                mensaje = "No hay sesión activa."
+                mensaje = "Token no válido."
             });
         }
 
         return Ok(new
         {
             autenticado = true,
-            proveedor = User.FindFirst("proveedor")?.Value,
-            id = User.FindFirst(ClaimTypes.NameIdentifier)?.Value,
-            nombre = User.Identity.Name,
-            email = User.FindFirst(ClaimTypes.Email)?.Value
+
+            id = User.FindFirst("sub")?.Value,
+
+            nombre = User.FindFirst("name")?.Value,
+
+            email = User.FindFirst("email")?.Value,
+
+            proveedor = User.FindFirst("provider")?.Value ?? "OpenIddict"
         });
     }
 
@@ -1542,25 +1580,179 @@ public class AuthController : ControllerBase
     {
         var configured = _configuration[$"{provider}:RedirectUri"];
 
-        return !string.IsNullOrWhiteSpace(configured)
-            ? configured
-            : $"{Request.Scheme}://{Request.Host}{defaultPath}";
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return configured;
+        }
+
+        var backendUrl = _configuration["BackendUrl"];
+
+        if (string.IsNullOrWhiteSpace(backendUrl))
+        {
+            throw new InvalidOperationException(
+                "BackendUrl no está configurado.");
+        }
+
+        return $"{backendUrl.TrimEnd('/')}{defaultPath}";
     }
 
-    private string CrearState(string provider)
+    private string CrearState(string provider, string? returnUrl)
     {
         var state = Guid.NewGuid().ToString("N");
-        HttpContext.Session.SetString($"oauth_state_{provider}", state);
+
+        HttpContext.Session.SetString(
+            $"oauth_state_{provider}",
+            state);
+
+        var destino = NormalizarReturnUrl(returnUrl);
+
+        if (destino != null)
+        {
+            HttpContext.Session.SetString(
+                $"oauth_return_{provider}",
+                destino);
+        }
+        else
+        {
+            HttpContext.Session.Remove($"oauth_return_{provider}");
+        }
+
         return state;
     }
 
     private bool ValidarState(string provider, string? state)
     {
-        var expected = HttpContext.Session.GetString($"oauth_state_{provider}");
+        var expected = HttpContext.Session.GetString(
+            $"oauth_state_{provider}");
+
         HttpContext.Session.Remove($"oauth_state_{provider}");
 
         return !string.IsNullOrWhiteSpace(expected) &&
                string.Equals(expected, state, StringComparison.Ordinal);
+    }
+
+    private string? TomarReturnUrl(string provider)
+    {
+        var destino = HttpContext.Session.GetString(
+            $"oauth_return_{provider}");
+
+        HttpContext.Session.Remove($"oauth_return_{provider}");
+
+        return NormalizarReturnUrl(destino);
+    }
+
+    // ---- state firmado (sin sesión) y tickets de traspaso, usados por TikTok ----
+    private string CrearStateFirmado(string? returnUrl)
+    {
+        var carga = JsonSerializer.Serialize(new EstadoOAuth(
+            Guid.NewGuid().ToString("N"),
+            NormalizarReturnUrl(returnUrl),
+            DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds()));
+
+        return _estadoProtector.Protect(carga);
+    }
+
+    private bool LeerStateFirmado(string? state, out string? returnUrl)
+    {
+        returnUrl = null;
+
+        if (string.IsNullOrWhiteSpace(state))
+            return false;
+
+        try
+        {
+            var carga = JsonSerializer.Deserialize<EstadoOAuth>(_estadoProtector.Unprotect(state));
+
+            if (carga == null ||
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds() > carga.Exp)
+            {
+                return false;
+            }
+
+            returnUrl = NormalizarReturnUrl(carga.Ret);
+            return true;
+        }
+        catch (System.Security.Cryptography.CryptographicException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private string CrearTicketTikTok(int usuarioId, string? returnUrl)
+    {
+        var carga = JsonSerializer.Serialize(new TicketLogin(
+            Guid.NewGuid().ToString("N"),
+            usuarioId,
+            NormalizarReturnUrl(returnUrl),
+            DateTimeOffset.UtcNow.AddMinutes(2).ToUnixTimeSeconds()));
+
+        return _ticketProtector.Protect(carga);
+    }
+
+    private async Task<IActionResult> CanjearTicketTikTok(string ticket)
+    {
+        TicketLogin? carga;
+
+        try
+        {
+            carga = JsonSerializer.Deserialize<TicketLogin>(_ticketProtector.Unprotect(ticket));
+        }
+        catch (Exception ex) when (ex is System.Security.Cryptography.CryptographicException or JsonException)
+        {
+            return VolverAlLogin("El ticket de inicio de sesión de TikTok no es válido.");
+        }
+
+        if (carga == null || DateTimeOffset.UtcNow.ToUnixTimeSeconds() > carga.Exp)
+        {
+            return VolverAlLogin("El ticket de inicio de sesión de TikTok expiró. Intenta de nuevo.");
+        }
+
+        // Un solo uso.
+        var clave = $"ticket:{carga.Nonce}";
+
+        if (await _cache.GetStringAsync(clave) != null)
+        {
+            return VolverAlLogin("El ticket de inicio de sesión de TikTok ya fue usado.");
+        }
+
+        await _cache.SetStringAsync(clave, "1", new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+        });
+
+        var usuario = await _context.Usuarios.FindAsync(carga.UsuarioId);
+
+        if (usuario == null)
+        {
+            return VolverAlLogin("El usuario del ticket no existe.");
+        }
+
+        return await FinalizarLogin(usuario, "TikTok", NormalizarReturnUrl(carga.Ret));
+    }
+
+    private static async Task<string> DetalleError(HttpResponseMessage respuesta)
+    {
+        var cuerpo = await respuesta.Content.ReadAsStringAsync();
+
+        return cuerpo.Length > 200 ? cuerpo[..200] : cuerpo;
+    }
+
+    private sealed record EstadoOAuth(string Nonce, string? Ret, long Exp);
+
+    private sealed record TicketLogin(string Nonce, int UsuarioId, string? Ret, long Exp);
+
+    private string? NormalizarReturnUrl(string? returnUrl)
+    {
+        if (string.IsNullOrWhiteSpace(returnUrl))
+            return null;
+
+        return Url.IsLocalUrl(returnUrl)
+            ? returnUrl
+            : null;
     }
 
     private static string CrearCodeVerifier()
@@ -1588,7 +1780,27 @@ public class AuthController : ControllerBase
     {
         return Redirect($"/login.html?error={Uri.EscapeDataString(mensaje)}");
     }
+    private async Task<IActionResult> FinalizarLogin(
+    Usuario usuario,
+    string proveedor,
+    string? returnUrl)
+    {
+        await IniciarSesionCookie(usuario, proveedor);
 
+        return RedirigirDespuesLogin(returnUrl);
+    }
+
+    private IActionResult RedirigirDespuesLogin(string? returnUrl)
+    {
+        var destino = NormalizarReturnUrl(returnUrl);
+
+        if (destino != null)
+        {
+            return Redirect(destino);
+        }
+
+        return IrAlPerfil();
+    }
     private IActionResult IrAlPerfil()
     {
         var frontendUrl = _configuration["FrontendUrl"];
